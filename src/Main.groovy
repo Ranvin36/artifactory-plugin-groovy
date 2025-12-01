@@ -5,9 +5,17 @@ def isBala(pathString){
     return pathString.endsWith('.bala');
 }
 
+def semverValidation(pkgVersion) {
+    def semVerPattern = /^(\d+)\.(\d+)\.(\d+)$/
+    if (!(pkgVersion ==~ semVerPattern)){
+        throw new Exception("Version $pkgVersion does not follow MAJOR.MINOR.PATCH format.")
+    }
+}
+
 def repositoryExists(path) {
     return repositories.exists(path);
 }
+
 
 storage{
     beforeCreate{item ->
@@ -21,20 +29,33 @@ storage{
         log.warn("ballerinaFilePath: $path , Repo : $repo, folderPath: $folderPath, fileName: $fileName");
 
         if (item.folder) return;
+        def packageData = pathString.split('/');
+        def repoOrg = packageData[0];
+        def orgName = repoOrg.split(':')[1];
+        def pkgName = packageData[1];
+        def pkgVersion = packageData[2];
+
+        // Applying semver validation
+        def versionValidation = semverValidation(pkgVersion)
 
         if(repositoryExists(path)){
             log.warn("Folder $ballerinaFilePath already exists.");
             throw new Exception("Folder $ballerinaFilePath already exists.$item");
         }
 
+        // Validating uploaded file is .bala
         if(!isBala(pathString) && !pathString.endsWith('metadata.json')){
             log.warn("Uploading files other than .bala is not allowed: $pathString");
             throw new Exception("Uploading files other than .bala is not allowed.$item");
         }
         else{
             log.warn("Uploading .bala file to repo: $repo at path: $path");
-            return;
+//            return;
         }
+
+        def modulePath = RepoPathFactory.create(repo, "${orgName}/${pkgName}/");
+        def existingVersion = repositories.getChildren(modulePath).collect {it.name};
+        log.warn("Existing versions for package $pkgName : $existingVersion");
     }
 
     afterCreate{item ->
