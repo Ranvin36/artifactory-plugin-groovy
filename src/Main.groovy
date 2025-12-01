@@ -1,8 +1,5 @@
 import groovy.json.JsonOutput;
 import org.artifactory.repo.RepoPathFactory;
-import java.nio.file.Files
-import java.nio.file.Paths
-
 
 def isBala(pathString){
     return pathString.endsWith('.bala');
@@ -11,7 +8,6 @@ def isBala(pathString){
 def repositoryExists(path) {
     return repositories.exists(path);
 }
-
 
 storage{
     beforeCreate{item ->
@@ -42,7 +38,7 @@ storage{
     }
 
     afterCreate{item ->
-        def itemPath = item.getRepoPath()
+        def itemPath = item.getRepoPath();
         def repoPath = item.getRepoKey();
         def itemPathString = itemPath.toString()
 
@@ -64,18 +60,12 @@ storage{
         ];
 
         def jsonContent = JsonOutput.prettyPrint(JsonOutput.toJson(metadata))
-        // def tempFilePath = Files.createTempFile("metadata-", ".json")
-        // Files.write(tempFilePath, jsonContent.getBytes())
 
-        log.warn("Generated Metadata JSON: ${jsonContent}");
         log.warn("Uploading Package Metadata to : $repoPath");
         def metaDataPath = RepoPathFactory.create(repoPath, "${orgName}/${pkgName}/${pkgVersion}/metadata.json");
-        repositories.deploy(metaDataPath, new ByteArrayInputStream(jsonContent.bytes))
+        if (!repositories.exists(metaDataPath)) {
+            repositories.deploy(metaDataPath, new ByteArrayInputStream(jsonContent.bytes))
+        }
 
-        // log.warn("Organization Name: ${orgName}");
-        // for (int j = 0; j < packageData.length; j++) {
-        //     log.warn("Path Segment ${j}: ${packageData[j]}");
-        // }
-        // log.info("Successfully uploaded item: ${path}");
     }
 }
