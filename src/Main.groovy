@@ -23,6 +23,35 @@ def repositoryExists(path) {
     return repositories.exists(path);
 }
 
+def digest(algo,bytes){
+    def md = java.security.MessageDigest.getInstance(algo);
+    def digestBytes = md.digest(bytes);
+    digestBytes.collect { String.format("%02x", it) }.join()
+}
+
+def getOrgName(name){
+    if(name == null) return null;
+    def orgTrim = name.trim()
+    return orgTrim.contains(':') ? orgTrim.split(':')[1] : orgTrim
+}
+
+// Build a normalized repository-relative path from segments (no leading/trailing slashes)
+def repoRelativePath(Object... parts){
+    def segments = parts.collect { it?.toString()?.trim() }
+    def cleaned = segments.findAll { it && it != '' }
+    return cleaned.join('/')
+}
+
+// Convenience wrapper to create RepoPath safely
+def createRepoPath(repoKey, Object... parts){
+    def rel = repoRelativePath(parts)
+    return RepoPathFactory.create(repoKey, rel)
+}
+
+// Used to safely get path parts avoiding index errors
+def safePathSplit(parts, index){
+    return (parts != null && parts.size() > index) ? parts[index] : null
+}
 
 storage{
     beforeCreate { item ->
@@ -40,25 +69,31 @@ storage{
             return
         }
 
-        def repoOrg = packageData[0]
-        def orgName = repoOrg.contains(':') ? repoOrg.split(':')[1] : repoOrg
-        def pkgName = packageData[1]
+        def repoOrg = safePathSplit(packageData,0)
+        def orgName = getOrgName(repoOrg)
+        def pkgName = safePathSplit(packageData,1)
         def pkgVersion = ""
         if (packageData.size() >= 3) {
-            pkgVersion = packageData[2]
+            pkgVersion = safePathSplit(packageData,2)
         }
+
+        if(!pkgName) return;
+
         // Semantic version validation (only when version present)
         if (pkgVersion) {
             semverValidation(pkgVersion)
         }
         // Check existing versions for the package
-        def modulePath = RepoPathFactory.create(repo, "${orgName}/${pkgName}/");
+        def modulePath = createRepoPath(repo, orgName, pkgName);
         def existingVersion = repositories.getChildren(modulePath)?.collect { it.name } ?: []
         log.warn("Existing versions for package $pkgName : $existingVersion")
-
+        // Prevent uploading same or lower version
         if (item.folder && packageData.size() == 3){
             if(existingVersion){
                 def maxVersion = existingVersion.max {a,b -> compareSemver(a,b)}
+                if(pkgVersion == maxVersion){
+                    throw new Exception("Uploaded version $pkgVersion already exists for package $pkgName.")
+                }
                 if(compareSemver(pkgVersion, maxVersion) <= 0){
                     throw new Exception("Uploaded version $pkgVersion is not greater than existing version $maxVersion for package $pkgName.")
                 }
@@ -72,18 +107,17 @@ storage{
             return
         }
 
-        def folderPath = pathString.substring(0, pathString.lastIndexOf('/') + 1)
-        def ballerinaFilePath = RepoPathFactory.create(repo, folderPath + fileName)
-        log.warn("ballerinaFilePath: $path , Repo : $repo, folderPath: $folderPath, fileName: $fileName")
+        // Build a normalized repo-relative file path for the uploaded file
+        def fileRepoPath = pkgVersion ? createRepoPath(repo, orgName, pkgName, pkgVersion, fileName) : createRepoPath(repo, orgName, pkgName, fileName)
+        log.warn("ballerinaFilePath: $fileRepoPath , Repo : $repo, fileName: $fileName")
 
-
-        if (repositoryExists(path)){
-            log.warn("Folder $ballerinaFilePath already exists.")
-            throw new Exception("Folder $ballerinaFilePath already exists.$item")
+        if (repositoryExists(fileRepoPath)){
+            log.warn("Resource $fileRepoPath already exists.")
+            throw new Exception("Resource $fileRepoPath already exists.$item")
         }
 
         // Validating uploaded file is .bala
-        if (!isBala(pathString) && !pathString.endsWith('metadata.json')){
+        if (!isBala(pathString) && !pathString.endsWith('metadata.json') && !pathString.endsWith('.sha256-file') && !pathString.endsWith('.sha1-file') && !pathString.endsWith('.md5-file')) {
             log.warn("Uploading files other than .bala is not allowed: $pathString")
             throw new Exception("Uploading files other than .bala is not allowed.$item")
         } else {
@@ -97,17 +131,18 @@ storage{
         def repoPath = item.getRepoKey();
         def itemPathString = itemPath.toString()
 
-        if (itemPathString.endsWith('metadata.json')) {
-            return
-        }
+        if (itemPathString.endsWith('metadata.json')) return;
+        if (itemPathString.endsWith('.sha256') || itemPathString.endsWith('.sha256-file') || itemPathString.endsWith('.sha1-file') || itemPathString.endsWith('.md5-file') || itemPathString == 'metadata.json') return
+
 
         def packageData = itemPathString.split('/');
 
-        def repoOrg = packageData[0];
-        def orgName = repoOrg.split(':')[1];
-        def pkgName = packageData[1];
-        def pkgVersion = packageData[2];
+        def repoOrg = safePathSplit(packageData,0);
+        def orgName = getOrgName(repoOrg)
+        def pkgName = safePathSplit(packageData,1);
+        def pkgVersion = safePathSplit(packageData,2);
 
+        // Creating metadata json file (package data)
         def metadata = [
                 "organization": orgName,
                 "package": pkgName,
@@ -119,7 +154,30 @@ storage{
         log.warn("Uploading Package Metadata to : $repoPath");
         def metaDataPath = RepoPathFactory.create(repoPath, "${orgName}/${pkgName}/${pkgVersion}/metadata.json");
         if (!repositories.exists(metaDataPath)) {
-            repositories.deploy(metaDataPath, new ByteArrayInputStream(jsonContent.bytes))
+            log.warn("Creating new metadata file at: $metaDataPath");
+            repositories.deploy(metaDataPath, new ByteArrayInputStream(jsonContent.bytes));
+        }
+
+        // Creating checksum files(SHA-256) for uploaded .bala files
+        if(!item.folder){
+            try {
+                def contentStream = repositories.getContent(itemPath);
+                def fileBytes = contentStream.inputStream.bytes;
+                def checksums = [
+                        "sha256": digest("sha256", fileBytes),
+                        "sha1": digest("sha1", fileBytes),
+                        "md5": digest("md5", fileBytes)
+                ]
+                log.warn("Uploading SHA-256 checksum for file at path: $itemPath.name");
+                checksums.each { algo, hashBytes ->
+                    def checksumFilePath = RepoPathFactory.create(repoPath, itemPath.path + ".${algo}-file");
+                    repositories.deploy(checksumFilePath, new ByteArrayInputStream(hashBytes.getBytes('UTF-8')));
+                    log.warn("Creating checksum file at: $checksumFilePath with $algo: $hashBytes");
+                }
+            } catch (MissingPropertyException e) {
+                // defensive fallback: if stream not available, skip checksum creation and log
+                log.error("Could not create checksum - no input stream available for item: $item - ${e.message}")
+            }
         }
 
     }
@@ -129,25 +187,33 @@ download{
     beforeDownloadRequest{ request, repoPath->
         def befDownloadPath = repoPath.toString();
         def splitPath = befDownloadPath.split('/');
+        def orgRepo = safePathSplit(splitPath,0);
+        def orgNameRequest = getOrgName(orgRepo)
+        def pkgNameRequest = safePathSplit(splitPath,1);
         def requestedFile = repoPath.name;
         def requestedPath = repoPath.path;
-        def requestedRepo = befDownloadPath.split('/')[0].split(':')[0];
+        def requestedRepo = repoPath.getRepoKey();
 
         // Break down the requested file name into parts
         def fileTokenize = requestedFile.tokenize('.');
-        log.warn("Attempting to download item at path: $befDownloadPath from repo: $requestedRepo");
+        log.warn("Attempting to download item at path: $befDownloadPath from repo: $requestedRepo requestedPath: $requestedPath requestedFile: $requestedFile");
         // Check if the request is for a folder/module or a specific file/version
         if (requestedFile == null || requestedFile.trim() == '' || fileTokenize.size() < 3) {
             // Apply the retrieve highest compatible version logic
 
             log.warn("Folder/module requested (no specific file/version): $requestedPath")
-            def requestModulePath = RepoPathFactory.create(requestedRepo, "/ranvin/hello_world/");
+            def requestModulePath = createRepoPath(requestedRepo, orgNameRequest, pkgNameRequest)
             def requestExistingVersions = repositories.getChildren(requestModulePath)?.collect { it.name } ?: []
             log.warn("Existing versions for module at path $requestModulePath : $requestExistingVersions");
-            def highestVersion = requestExistingVersions.max {a,b -> compareSemver(a,b)}
+            // filter only valid semver entries
+            def semvers = requestExistingVersions.findAll { it ==~ /^\d+\.\d+\.\d+$/ }
+            if (!semvers) {
+                log.warn("No semver versions found for module at $requestModulePath; cannot redirect")
+                return
+            }
+            def highestVersion = semvers.max {a,b -> compareSemver(a,b)}
             log.warn("Highest compatible version determined: $highestVersion")
-            def newPath = "/ranvin/hello_world/${highestVersion}/hello_world-${highestVersion}.bala";
-            def newDownloadPath = RepoPathFactory.create(requestedRepo, newPath);
+            def newDownloadPath = createRepoPath(requestedRepo, orgNameRequest, pkgNameRequest, highestVersion, "${pkgNameRequest}-${highestVersion}.bala")
             request.setRepoPath(newDownloadPath);
             log.warn("Redirecting download request to path: $newDownloadPath")
         } else {
@@ -155,5 +221,3 @@ download{
         }
     }
 }
-
-
