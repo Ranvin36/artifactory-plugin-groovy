@@ -8,11 +8,13 @@ import groovy.json.JsonSlurper
 import java.nio.charset.StandardCharsets
 import groovy.json.JsonBuilder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.regex.Pattern
 
 @Field static final String UPSTREAM_SERVER = "http://10.100.1.29:8000/files/"
 @Field static final int UPSTREAM_MAX_ATTEMPTS = 4
 @Field static final long UPSTREAM_BASE_DELAY_MS = 500 // initial backoff
 @Field static final long UPSTREAM_MAX_DELAY_MS = 8000 // cap backoff
+@Field static final Pattern SAFE_SEGMENT = ~/^[A-Za-z0-9._-]+$/
 
 def getCombineRepositories(requestedConfig, requestedRepoKey) {
     def members = requestedConfig.repositories ?: []
@@ -27,7 +29,7 @@ def getCombineRepositories(requestedConfig, requestedRepoKey) {
 
 def parseRequestedVersionPath(String requestPath) {
     def parts = requestPath?.tokenize('/') ?: []
-    if (parts.size() < 4) {
+    if (parts.size() != 4) {
         return null
     }
 
@@ -35,6 +37,11 @@ def parseRequestedVersionPath(String requestPath) {
     def version = parts[parts.size() - 2]
     def pkgName = parts[parts.size() - 3]
     def org = parts[parts.size() - 4]
+
+    def segments = [org, pkgName, version, fileName]
+    if (segments.any { !it || !(it ==~ SAFE_SEGMENT) } || segments.any { it.contains('..') }) {
+        return null
+    }
 
     return [org: org, pkgName: pkgName, version: version, fileName: fileName, relativePath: requestPath]
 }
@@ -97,53 +104,51 @@ def deployVersionJsonToRepo(String targetRepoKey, String itemPath, String versio
     log.warn("Successfully deployed version.json to ${targetRepoKey} at ${versionJsonPath}")
 }
 
-@Field def requestToVirtual = new ConcurrentHashMap<String, Map>()
-
 download {
     beforeDownloadRequest { request, repoPath ->
         def requestedRepoKey = repoPath?.repoKey
         def requestInfo = parseRequestedVersionPath(repoPath?.path)
 
-        if (requestedRepoKey) {
-            def key = "${repoPath.path}"
-            requestToVirtual[key] = [repoKey: requestedRepoKey, ts: System.currentTimeMillis(), requestInfo: requestInfo]
-            log.warn("Requested repo key: ${requestedRepoKey}, path: ${repoPath.path}")
-            if (requestInfo) {
-                log.warn("Parsed version path org=${requestInfo.org}, pkgName=${requestInfo.pkgName}, version=${requestInfo.version}, file=${requestInfo.fileName}")
-            }
+        if (!requestInfo) {
+            log.warn("Rejected request with invalid version path shape: ${repoPath?.path}")
+            return
         }
 
-      log.warn("Before download: repoKey=${repoPath?.repoKey}, path=${repoPath?.path}")
+        log.warn("Requested repo key: ${requestedRepoKey}, path: ${repoPath.path}")
+        log.warn("Parsed version path org=${requestInfo.org}, pkgName=${requestInfo.pkgName}, version=${requestInfo.version}, file=${requestInfo.fileName}")
 
-      def metadataCheck = repoPath?.getPath()?.endsWith("versions.json")
-      
-      if(metadataCheck) {
-        // Fetch versions.json from upstream
+        log.warn("Before download: repoKey=${repoPath?.repoKey}, path=${repoPath?.path}")
+
+        def metadataCheck = repoPath?.path?.endsWith("versions.json")
+        if (!metadataCheck) {
+            return
+        }
+
         log.warn("Detected request for versions.json")
-                def versionJsonData = fetchVersionJsonFromUpstream(UPSTREAM_SERVER, repoPath.path)
-        
-        if (versionJsonData) {
-            // Check if this was a virtual repository request
-            def requestContext = requestToVirtual.get(repoPath.path)
-            def requestedRepoKeyFromContext = requestContext?.repoKey ?: requestedRepoKey
-            def requestedRepoConfiguration = requestedRepoKeyFromContext ? repositories.getRepositoryConfiguration(requestedRepoKeyFromContext) : null
-            def isVirtualRequest = requestedRepoConfiguration?.type?.toString() == "virtual"
-            
-            if (isVirtualRequest) {
-                log.warn("Detected virtual repo request for versions.json: " + requestedRepoKeyFromContext)
-                def localMembers = getCombineRepositories(requestedRepoConfiguration, requestedRepoKeyFromContext)
-                
-                if (!localMembers.isEmpty()) {
-                    // Deploy versions.json to each local member
-                    def versionJsonString = new groovy.json.JsonBuilder(versionJsonData).toString()
-                    localMembers.each { member ->
-                        deployVersionJsonToRepo(member.key, repoPath.path, versionJsonString)
-                    }
-                    log.warn("Versions.json deployed to ${localMembers.size()} local repositories")
-                }
-            }
+        def versionJsonData = fetchVersionJsonFromUpstream(UPSTREAM_SERVER, repoPath.path)
+        if (!versionJsonData) {
+            return
         }
-      }
 
+        def requestedRepoConfiguration = requestedRepoKey ? repositories.getRepositoryConfiguration(requestedRepoKey) : null
+        def isVirtualRequest = requestedRepoConfiguration?.type?.toString() == "virtual"
+
+        if (!isVirtualRequest) {
+            log.warn("Skipping deploy because repo is not virtual: ${requestedRepoKey}")
+            return
+        }
+
+        log.warn("Detected virtual repo request for versions.json: ${requestedRepoKey}")
+        def localMembers = getCombineRepositories(requestedRepoConfiguration, requestedRepoKey)
+        if (localMembers.isEmpty()) {
+            log.warn("No local members found for virtual repo: ${requestedRepoKey}")
+            return
+        }
+
+        def versionJsonString = new groovy.json.JsonBuilder(versionJsonData).toString()
+        localMembers.each { member ->
+            deployVersionJsonToRepo(member.key, repoPath.path, versionJsonString)
+        }
+        log.warn("Versions.json deployed to ${localMembers.size()} local repositories")
     }
 }
