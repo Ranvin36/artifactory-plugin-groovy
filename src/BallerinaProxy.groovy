@@ -10,6 +10,9 @@ import groovy.json.JsonBuilder
 import java.util.concurrent.ConcurrentHashMap
 
 @Field static final String UPSTREAM_SERVER = "http://10.100.1.29:8000/files/"
+@Field static final int UPSTREAM_MAX_ATTEMPTS = 4
+@Field static final long UPSTREAM_BASE_DELAY_MS = 500 // initial backoff
+@Field static final long UPSTREAM_MAX_DELAY_MS = 8000 // cap backoff
 
 def getCombineRepositories(requestedConfig, requestedRepoKey) {
     def members = requestedConfig.repositories ?: []
@@ -37,27 +40,51 @@ def parseRequestedVersionPath(String requestPath) {
 }
 
 def fetchVersionJsonFromUpstream(upstreamServer, relativePath) {
-    try {
-        def fileUrl = upstreamServer + relativePath
-        def connection = new URL(fileUrl).openConnection() as HttpURLConnection
-        connection.requestMethod = "GET"
-        connection.connectTimeout = 5000
-        connection.readTimeout = 5000
-        
-        if(connection.responseCode == 200) {
-            def content = connection.inputStream.text
-            def jsonSlurper = new JsonSlurper()
-            def versionData = jsonSlurper.parseText(content)
-            log.warn("Successfully retrieved version.json from upstream: $versionData")
-            return versionData
-        } else {
-            log.warn("Failed to fetch version.json from upstream: HTTP ${connection.responseCode}")
-            return null
+    def attempts = 0
+    while (attempts < UPSTREAM_MAX_ATTEMPTS) {
+        attempts++
+        try {
+            def fileUrl = upstreamServer + relativePath
+            def connection = new URL(fileUrl).openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 5000
+            connection.readTimeout = 5000
+
+            def code = connection.responseCode
+            if (code == 200) {
+                def content = connection.inputStream.text
+                def jsonSlurper = new JsonSlurper()
+                def versionData = jsonSlurper.parseText(content)
+                log.warn("Successfully retrieved version.json from upstream on attempt ${attempts}: $versionData")
+                return versionData
+            } else {
+                log.warn("Upstream responded HTTP ${code} on attempt ${attempts} for ${relativePath}")
+                if (code >= 500 && attempts < UPSTREAM_MAX_ATTEMPTS) {
+                    def backoff = Math.min(UPSTREAM_MAX_DELAY_MS, UPSTREAM_BASE_DELAY_MS * Math.pow(2, attempts - 1))
+                    def jitter = Math.random() * backoff * 0.5
+                    def sleepMs = (long)(backoff + jitter)
+                    log.warn("Retrying after ${sleepMs}ms (attempt ${attempts}/${UPSTREAM_MAX_ATTEMPTS})")
+                    Thread.sleep(sleepMs)
+                    continue
+                } else {
+                    return null
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error fetching version.json from upstream on attempt ${attempts}: ${e.message}")
+            if (attempts < UPSTREAM_MAX_ATTEMPTS) {
+                def backoff = Math.min(UPSTREAM_MAX_DELAY_MS, UPSTREAM_BASE_DELAY_MS * Math.pow(2, attempts - 1))
+                def jitter = Math.random() * backoff * 0.5
+                def sleepMs = (long)(backoff + jitter)
+                log.warn("Retrying after ${sleepMs}ms due to exception (attempt ${attempts}/${UPSTREAM_MAX_ATTEMPTS})")
+                Thread.sleep(sleepMs)
+                continue
+            } else {
+                return null
+            }
         }
-    } catch(Exception e) {
-        log.error("Error fetching version.json from upstream: ${e.message}")
-        return null
     }
+    return null
 }
 
 def deployVersionJsonToRepo(String targetRepoKey, String itemPath, String versionJsonContent) {
