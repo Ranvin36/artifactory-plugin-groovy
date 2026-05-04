@@ -7,6 +7,7 @@ import java.util.zip.ZipEntry
 import groovy.json.JsonSlurper
 import java.nio.charset.StandardCharsets
 import groovy.json.JsonBuilder
+import java.util.concurrent.ConcurrentHashMap
 
 def parseJson(content) {
     def jsonSlurper = new JsonSlurper()
@@ -51,8 +52,9 @@ def buildBOM(dependencies) {
 }
 
 def deploySbom(item, String sbomJson) {
-    // Create a path for the new file: my-package.bala.json
-    def sbomPath = "${item.repoPath.path}.json"
+    // Create a path for the new file: bom.cdx.json in the same directory as the artifact
+    def basePath = item.repoPath.path.replaceAll(/\/[^\/]*$/, '')
+    def sbomPath = "${basePath}/bom.cdx.json"
     def sbomRepoPath = org.artifactory.repo.RepoPathFactory.create(item.repoKey, sbomPath)
     
     // Convert String to InputStream
@@ -98,16 +100,81 @@ def extractItemsFromZip(inputStream) {
     return [packageJson: packageJsonContent, dependencyGraph: dependencyGraphContent]
 }
 
-storage{
+def getCombineRepositories(requestedConfig, requestedRepoKey) {
+    def members = requestedConfig.repositories ?: []
+    def localMembers = members.collect { memberKey ->
+        def memberConfig = repositories.getRepositoryConfiguration(memberKey)
+        [key: memberKey, type: memberConfig?.type?.toString()]
+    }.findAll { it.type == "local" }
+
+    log.warn("Virtual repo ${requestedRepoKey} local members: ${localMembers}")
+    return localMembers
+}
+
+def deploySbomToRepo(String targetRepoKey, String itemPath, String sbomJson) {
+    // Deploy SBOM to a specific target repo: bom.cdx.json in the same directory
+    def basePath = itemPath.replaceAll(/\/[^\/]*$/, '')
+    def sbomPath = "${basePath}/bom.cdx.json"
+    def sbomRepoPath = org.artifactory.repo.RepoPathFactory.create(targetRepoKey, sbomPath)
+    
+    // Convert String to InputStream
+    def is = new ByteArrayInputStream(sbomJson.getBytes("UTF-8"))
+    
+    // Deploy to Artifactory
+    repositories.deploy(sbomRepoPath, is)
+    log.warn("Successfully deployed SBOM to ${targetRepoKey} at ${sbomPath}")
+}
+
+@Field def requestToVirtual = new ConcurrentHashMap<String, Map>() 
+
+download {
+    beforeDownloadRequest { request, repoPath ->
+        // This is the repo key from the original client URL (can be virtual)
+        def requestedRepoKey = repoPath?.repoKey
+
+        if (requestedRepoKey) {
+            def key = "${repoPath.path}" // correlate by path; can include more fields if needed
+            requestToVirtual[key] = [repoKey: requestedRepoKey, ts: System.currentTimeMillis()]
+            log.warn("Requested repo key: ${requestedRepoKey}, path: ${repoPath.path}")
+        }
+    }
+}
+
+storage {
     afterCreate{item ->
         log.warn("Artifact Created: " + item.repoPath.toString())
         def repoKey = item.repoKey
         def repoConfiguration = repositories.getRepositoryConfiguration(repoKey)
         def itemPath = item.repoPath;
+        def requestContext = requestToVirtual.remove(itemPath.path)
+        def requestedRepoKey = requestContext?.repoKey
+        def requestedRepoConfiguration = requestedRepoKey ? repositories.getRepositoryConfiguration(requestedRepoKey) : null
+        def isVirtualRequest = requestedRepoConfiguration?.type?.toString() == "virtual"
+
+        if (isVirtualRequest) {
+            log.warn("Detected virtual repo request: " + requestedRepoKey)
+        }
+        if (requestedRepoConfiguration != null) {
+            log.warn(requestedRepoConfiguration.type + " - " + requestedRepoKey)
+        }
 
         boolean isUpstream = repoKey.endsWith("-cache")
+        def localMembers = []
+        if (isVirtualRequest) {
+            localMembers = getCombineRepositories(requestedRepoConfiguration, requestedRepoKey)
+        }
+        // if(repoConfiguration instanceof VirtualRepoConfiguration) {
+        //     log.warn("Repository " + repoKey + " is a virtual repository. Skipping SBOM generation.")
+        //     return
+        // }
 
-        if (isUpstream) {
+        // Skip SBOM files themselves to prevent recursive deployment
+        if (itemPath.path.endsWith(".cdx.bom.json")) {
+            log.warn("Skipping SBOM file: " + itemPath.path)
+            return
+        }
+
+        if (isUpstream && itemPath.path.endsWith(".bala")) {
             def packageJson = null
             def dependencyGraph = null
             def dependencies = []
@@ -128,7 +195,16 @@ storage{
 
             def allDependencies = dependencies + ballerinaDependencies
             if (!allDependencies.isEmpty()) {
-                deploySbom(item, buildBOM(allDependencies))
+                def sbomJson = buildBOM(allDependencies)
+                if (isVirtualRequest && !localMembers.isEmpty()) {
+                    // Deploy to each local member of the virtual repo
+                    localMembers.each { member ->
+                        deploySbomToRepo(member.key, itemPath.path, sbomJson)
+                    }
+                } else {
+                    // Deploy to physical repo
+                    deploySbom(item, sbomJson)
+                }
             } else {
                 log.warn("No dependencies found in ${item.name}; skipping SBOM deployment")
             }
